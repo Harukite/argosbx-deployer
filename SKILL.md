@@ -35,3 +35,4 @@ bash -n argosbx-deploy.sh
 - 2026-08-05：Shadowrocket 报“服务器 URL 遇到问题”时，首要检查客户端与订阅格式；Shadowrocket 应导入 Clash YAML，不应把 Sing-box JSON 或未经编码的原始 URI 列表当作 Clash 订阅。
 - 2026-08-05：Quick Tunnel 重启会换域名；订阅刷新必须与 cloudflared 服务生命周期绑定，并以生成产物校验为停止条件，不能只看上游 `list` 的退出码。
 - 2026-08-05：CDN 优选只能按测量位置描述；VPS 到 Cloudflare 的最快 IP 不保证手机实际网络最快，脚本应允许客户端测量后的手工覆盖。
+- 2026-08-05：GitHub 一行安装命令必须先下载到本地文件再执行；安装器依赖 `$BASH_SOURCE` 把自身安装为 systemd 刷新 helper，不能直接 `curl | bash`。

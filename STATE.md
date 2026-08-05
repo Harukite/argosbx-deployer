@@ -12,6 +12,7 @@ Last run: 2026-08-05
 - 参数化 Reality SNI、端口、UUID、订阅令牌、CDN 候选 IP、Quick/Named Tunnel。
 - 实现备份、`--force` 可恢复替换、环回 VMess 源站、原子订阅刷新和安装后验证。
 - `tests/test_installer.sh` 已通过；`bash -n` 已通过。
+- 已推送到公共仓库 <https://github.com/Harukite/argosbx-deployer>，main 提交为 `c6cfbd9`；raw 安装器下载和本地 SHA256 已核对一致。
 
 ## 未决/已知风险
 
