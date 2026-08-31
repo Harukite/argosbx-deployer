@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="0.1.0"
+readonly INSTALLER_VERSION="0.2.0"
 readonly UPSTREAM_REPO="https://github.com/yonggekkk/argosbx"
 readonly UPSTREAM_COMMIT="59e5d34519253fe2f17f4789dba22e2ad09e9b57"
 readonly UPSTREAM_SHA256="95ec2799ba39a2eab15be3effaf5cfa5b2fdda64bf6a086e2aecf30369e483d7"
@@ -19,6 +19,8 @@ readonly DEPLOY_SELF="/root/bin/argosbx-deploy"
 readonly XCONF="/root/agsbx/xr.json"
 readonly XRAY_BIN="/root/agsbx/xray"
 readonly CLOUDFLARED_BIN="/root/agsbx/cloudflared"
+readonly -a SUBSCRIPTION_FILES=(clmi.yaml sbox.json sbox-1.14.json sbox-legacy.json jhsub.txt)
+readonly -a STRUCTURED_SUBSCRIPTION_FILES=(clmi.yaml sbox.json sbox-1.14.json sbox-legacy.json)
 
 NODE_NAME=${NODE_NAME:-argosbx}
 REALITY_SNI=${REALITY_SNI:-www.bing.com}
@@ -168,6 +170,7 @@ Argosbx installer $INSTALLER_VERSION (dry-run)
   Hysteria2 port  : $HY2_PORT/udp
   VMess origin    : 127.0.0.1:$VMESS_ORIGIN_PORT (never public)
   Argo mode       : $ARGO_MODE
+  Sing-box configs: 1.11, 1.12-1.13, 1.14+
   CDN probe       : $([[ "$SKIP_CDN_PROBE" == 1 ]] && printf disabled || printf enabled)
   BBR/fq          : $([[ "$SKIP_BBR" == 1 ]] && printf disabled || printf enabled)
   force           : $FORCE
@@ -228,7 +231,7 @@ move_existing_targets() {
       /etc/systemd/system/argosbx-sub.service; do
       [[ -e "$path" || -L "$path" ]] && die "$path already exists; use --force"
     done
-    return
+    return 0
   }
   local service path
   for service in xr.service sb.service sing-box.service argo.service argosbx-argo.service argosbx-sub.service; do
@@ -354,10 +357,10 @@ PY
 
 run_upstream() {
   local upstream_log="$BACKUP_DIR/upstream-install.log"
-  local status
+  local status runner
   local -a environment=(
     HOME=/root
-    LANG=en_US.UTF-8
+    LANG=C.UTF-8
     vlpt="$VLESS_PORT"
     hypt="$HY2_PORT"
     vmpt="$VMESS_ORIGIN_PORT"
@@ -367,11 +370,17 @@ run_upstream() {
     argo=
   )
   [[ -n "$UUID" ]] && environment+=(uuid="$UUID")
+  runner=$(mktemp "$BACKUP_DIR/upstream-run.XXXXXX")
+  install -m 700 -o root -g root "$BIN_DIR/agsbx" "$runner"
   log "running pinned upstream generator (log: $upstream_log)"
   set +e
-  timeout 900s env -i PATH="$PATH" "${environment[@]}" bash "$BIN_DIR/agsbx" 2>&1 | tee "$upstream_log"
+  timeout 900s env -i PATH="$PATH" "${environment[@]}" bash "$runner" 2>&1 | tee "$upstream_log"
   status=${PIPESTATUS[0]}
   set -e
+  rm -f -- "$runner"
+  # Upstream refreshes /root/bin/agsbx while installing. Restore the pinned,
+  # compatibility-patched copy used by later subscription refreshes.
+  download_upstream
   (( status == 0 )) || die "upstream generator failed; see $upstream_log"
   [[ -x "$XRAY_BIN" && -f "$XCONF" && -f "$STATE_DIR/uuid" ]] || die "upstream did not create Xray state"
   if [[ "$(uname -m)" == x86_64 ]]; then
@@ -452,7 +461,7 @@ install_subscription_layout() {
   [[ "$SUB_TOKEN" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || die "subscription token is invalid"
   mkdir -p -m 700 "$WEB_ROOT/$SUB_TOKEN"
   local file
-  for file in clmi.yaml sbox.json jhsub.txt; do
+  for file in "${SUBSCRIPTION_FILES[@]}"; do
     [[ -e "$STATE_DIR/$file" ]] || : > "$STATE_DIR/$file"
     if [[ -e "$WEB_ROOT/$SUB_TOKEN/$file" || -L "$WEB_ROOT/$SUB_TOKEN/$file" ]]; then rm -f -- "$WEB_ROOT/$SUB_TOKEN/$file"; fi
     ln -s "$STATE_DIR/$file" "$WEB_ROOT/$SUB_TOKEN/$file"
@@ -463,13 +472,76 @@ $SUB_TOKEN
 TOKEN
 }
 
+generate_sing_box_variants() {
+  local source=$1 modern_destination=$2 legacy_destination=$3
+  python3 - "$source" "$modern_destination" "$legacy_destination" <<'PY'
+import copy
+import json
+import os
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+modern_destination = Path(sys.argv[2])
+legacy_destination = Path(sys.argv[3])
+base = json.loads(source.read_text())
+
+modern = copy.deepcopy(base)
+modern["http_clients"] = [{"tag": "http-client-direct"}]
+modern["route"]["default_http_client"] = "http-client-direct"
+
+legacy = copy.deepcopy(base)
+legacy["dns"]["servers"] = [
+    {
+        "tag": "aliDns",
+        "address": "https://dns.alidns.com/dns-query",
+        "address_resolver": "local",
+    },
+    {"tag": "local", "address": "223.5.5.5"},
+    {
+        "tag": "proxyDns",
+        "address": "https://dns.google/dns-query",
+        "address_resolver": "aliDns",
+        "detour": "proxy",
+    },
+    {"tag": "fakeip", "address": "fakeip"},
+]
+legacy["dns"]["fakeip"] = {
+    "enabled": True,
+    "inet4_range": "198.18.0.0/15",
+    "inet6_range": "fc00::/18",
+}
+legacy["route"].pop("default_domain_resolver", None)
+
+for destination, config in (
+    (modern_destination, modern),
+    (legacy_destination, legacy),
+):
+    destination.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    os.chmod(destination, 0o600)
+PY
+}
+
+wait_for_quick_tunnel_domain() {
+  local log_file=$1 max_attempts=${2:-60} attempt domain
+  for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+    domain=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -n1 | sed 's#^https://##' || true)
+    if valid_host "$domain" && [[ "$domain" == *.trycloudflare.com ]]; then
+      printf '%s\n' "$domain"
+      return 0
+    fi
+    (( attempt == max_attempts )) || sleep 1
+  done
+  return 1
+}
+
 refresh_subscriptions() {
   local mode domain stage list_status=0 token file vless_count hy2_count vmess_count domain_in_raw=false
   mode=$(cat "$STATE_DIR/argo-mode" 2>/dev/null || printf quick)
   if [[ "$mode" == named ]]; then
     domain=$(tr -d '[:space:]' < "$STATE_DIR/sbargoym.log" 2>/dev/null || true)
   else
-    domain=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE_DIR/argo.log" 2>/dev/null | tail -n1 | sed 's#^https://##' || true)
+    domain=$(wait_for_quick_tunnel_domain "$STATE_DIR/argo.log" 60 || true)
   fi
   [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.([A-Za-z]{2,})$ ]] || die "Argo hostname unavailable"
   [[ -f "$BIN_DIR/agsbx" ]] || die "patched generator missing"
@@ -505,11 +577,17 @@ path.write_text("\n".join(kept) + "\n")
 PY
   python3 -m json.tool "$stage/agsbx/sbox.json" >/dev/null || die "generated sbox.json is invalid"
   grep -Eq '"(http_clients|default_http_client)"' "$stage/agsbx/sbox.json" && die "unsupported sing-box fields generated"
+  generate_sing_box_variants \
+    "$stage/agsbx/sbox.json" \
+    "$stage/agsbx/sbox-1.14.json" \
+    "$stage/agsbx/sbox-legacy.json"
+  python3 -m json.tool "$stage/agsbx/sbox-1.14.json" >/dev/null || die "generated sbox-1.14.json is invalid"
+  python3 -m json.tool "$stage/agsbx/sbox-legacy.json" >/dev/null || die "generated sbox-legacy.json is invalid"
   vless_count=$(grep -c '^vless://' "$stage/agsbx/jhsub.txt" || true)
   hy2_count=$(grep -c '^hysteria2://' "$stage/agsbx/jhsub.txt" || true)
   vmess_count=$(grep -c '^vmess://' "$stage/agsbx/jhsub.txt" || true)
   (( vless_count >= 1 && hy2_count >= 1 && vmess_count >= 1 )) || die "subscription misses a required protocol"
-  for file in clmi.yaml sbox.json; do
+  for file in "${STRUCTURED_SUBSCRIPTION_FILES[@]}"; do
     [[ -s "$stage/agsbx/$file" ]] || die "generated $file is empty"
     grep -Fq "$domain" "$stage/agsbx/$file" || die "generated $file lacks active Argo hostname"
   done
@@ -520,7 +598,7 @@ PY
   [[ "$domain_in_raw" == true ]] || die "raw subscription lacks active Argo hostname"
   token=$(tr -d '[:space:]' < "$STATE_DIR/sub-token" 2>/dev/null || true)
   [[ "$token" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || die "subscription token missing"
-  for file in clmi.yaml sbox.json jhsub.txt; do
+  for file in "${SUBSCRIPTION_FILES[@]}"; do
     chmod 600 "$stage/agsbx/$file"; chown root:root "$stage/agsbx/$file"
     mv -f -- "$stage/agsbx/$file" "$STATE_DIR/$file"
   done
@@ -649,7 +727,9 @@ discover_public_ipv4() {
 wait_for_subscriptions() {
   local url="http://127.0.0.1/$SUB_TOKEN/clmi.yaml"
   for _ in $(seq 1 90); do
-    if [[ -s "$STATE_DIR/clmi.yaml" && -s "$STATE_DIR/sbox.json" && -s "$STATE_DIR/jhsub.txt" ]] && \
+    if [[ -s "$STATE_DIR/clmi.yaml" && -s "$STATE_DIR/sbox.json" && \
+          -s "$STATE_DIR/sbox-1.14.json" && -s "$STATE_DIR/sbox-legacy.json" && \
+          -s "$STATE_DIR/jhsub.txt" ]] && \
        curl --fail --silent --max-time 5 "$url" | grep -q '^proxies:'; then
       return
     fi
@@ -662,6 +742,8 @@ wait_for_subscriptions() {
 verify_installation() {
   "$XRAY_BIN" run -test -config "$XCONF" >/dev/null || die "Xray verification failed"
   python3 -m json.tool "$STATE_DIR/sbox.json" >/dev/null || die "sbox.json verification failed"
+  python3 -m json.tool "$STATE_DIR/sbox-1.14.json" >/dev/null || die "sbox-1.14.json verification failed"
+  python3 -m json.tool "$STATE_DIR/sbox-legacy.json" >/dev/null || die "sbox-legacy.json verification failed"
   grep -q '^proxies:' "$STATE_DIR/clmi.yaml" || die "Clash YAML lacks proxies"
   (( $(grep -c '^vmess://' "$STATE_DIR/jhsub.txt" || true) >= 1 )) || die "raw subscription lacks VMess"
   ss -lnt | awk '$4 ~ /127\.0\.0\.1:'"$VMESS_ORIGIN_PORT"'$/ {found=1} END {exit(found ? 0 : 1)}' || die "VMess origin is not loopback-only"
@@ -677,7 +759,9 @@ write_delivery_info() {
   if [[ -n "$PUBLIC_IPV4" ]]; then SUB_BASE="http://$PUBLIC_IPV4/$SUB_TOKEN"; else SUB_BASE="http://<VPS_IPV4>/$SUB_TOKEN"; warn "public IPv4 discovery failed"; fi
   write_atomic "$STATE_DIR/subscription.txt" 600 <<INFO
 Clash/Mihomo/Shadowrocket (Subscribe): $SUB_BASE/clmi.yaml
-Sing-box: $SUB_BASE/sbox.json
+Sing-box 1.12-1.13: $SUB_BASE/sbox.json
+Sing-box 1.14+: $SUB_BASE/sbox-1.14.json
+Sing-box 1.11: $SUB_BASE/sbox-legacy.json
 Raw URI list: $SUB_BASE/jhsub.txt
 CDN primary IPv4: $CF_PRIMARY_IP:443
 CDN backup IPv4: $CF_BACKUP_IP:80
@@ -685,7 +769,9 @@ Argo mode: $ARGO_MODE
 INFO
   log "deployment complete; subscription URLs:"
   printf '  Clash/Shadowrocket: %s/clmi.yaml\n' "$SUB_BASE"
-  printf '  Sing-box:           %s/sbox.json\n' "$SUB_BASE"
+  printf '  Sing-box 1.12-1.13: %s/sbox.json\n' "$SUB_BASE"
+  printf '  Sing-box 1.14+:     %s/sbox-1.14.json\n' "$SUB_BASE"
+  printf '  Sing-box 1.11:      %s/sbox-legacy.json\n' "$SUB_BASE"
   printf '  Raw URI list:       %s/jhsub.txt\n' "$SUB_BASE"
   printf '  local record:       %s/subscription.txt\n' "$STATE_DIR"
 }
@@ -714,8 +800,10 @@ main() {
   write_delivery_info
 }
 
-if [[ ${1:-} == --refresh ]]; then
-  refresh_subscriptions
-else
-  main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ ${1:-} == --refresh ]]; then
+    refresh_subscriptions
+  else
+    main "$@"
+  fi
 fi

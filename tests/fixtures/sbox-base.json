@@ -1,0 +1,76 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "aliDns",
+        "server": "dns.alidns.com",
+        "path": "/dns-query",
+        "domain_resolver": "local"
+      },
+      {
+        "type": "udp",
+        "tag": "local",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "https",
+        "tag": "proxyDns",
+        "server": "dns.google",
+        "path": "/dns-query",
+        "domain_resolver": "aliDns",
+        "detour": "proxy"
+      },
+      {
+        "type": "fakeip",
+        "tag": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [],
+    "final": "proxyDns"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fd00::1/126"
+      ],
+      "auto_route": true
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://example.com/geosite-cn.srs"
+      }
+    ],
+    "final": "proxy",
+    "default_domain_resolver": {
+      "server": "aliDns"
+    }
+  },
+  "outbounds": [
+    {
+      "type": "vmess",
+      "tag": "proxy",
+      "server": "fixture.trycloudflare.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "security": "auto"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
